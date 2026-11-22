@@ -2,40 +2,87 @@ name: Login to Majsoul
 
 on:
   schedule:
-    - cron: '5 21 * * *'  # 21:05 UTC time (6:05 a.m. Korean time)
+    - cron: '5 21 * * *' # 06:05 in Korea and Japan
   workflow_dispatch:
+
+concurrency: majsoul-daily-checkin
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Log in and claim the Fortune Charm
+        env:
+          MS_SERVER: jp
+          UID: ${{ secrets.UID }}
+          TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          node <<'NODE'
+          const print = console.log.bind(console);
+          console.log = () => {};
+          console.warn = () => {};
+          console.error = () => {};
+          const client = require('./src/index.js');
+          let phase = 'account configuration';
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
+          async function checkIn() {
+            const config = client.loadRuntimeConfig();
+            phase = 'server discovery';
+            const context = await client.loadServerContext(config.server);
+            phase = 'login';
+            const session = await client.createSession(context, config);
+            print('Japan server login: confirmed');
+            try {
+              phase = 'Fortune Charm';
+              const response = await session.common('.lq.Lobby.payMonthTicket', session.proto.ResPayMonthTicket);
+              const code = Number(response.error?.code ?? 0);
+              if (code) {
+                print('Fortune Charm: no claim (server code ' + code + ')');
+              } else {
+                const received = Number(response.resource_count ?? response.resourceCount ?? 0) > 0;
+                print(received ? 'Fortune Charm: claimed' : 'Fortune Charm: no new reward returned');
+              }
+            } finally {
+              await session.close();
+            }
+          }
 
-    - name: Install dependencies
-      run: npm ci
+          checkIn().catch(error => {
+            const codes = [...new Set([...String(error?.message).matchAll(/"code"\s*:\s*(\d{1,6})\b/g)].map(match => match[1]))];
+            const details = codes.length ? ' (server code ' + codes.join(', ') + ')' : '';
+            print('Check-in failed during ' + phase + details);
+            process.exitCode = 1;
+          });
+          NODE
 
-    - name: Execute month ticket automation
-      run: npm start
-      env:
-        UID: ${{ secrets.UID }}
-        TOKEN: ${{ secrets.TOKEN }}
-        EMAIL: ${{ secrets.EMAIL }}
-        PASSWORD: ${{ secrets.PASSWORD }}
-        MS_SERVER: ${{ secrets.MS_SERVER }}
-
-    - name: Update Keep-Alive File
-      run: |
-        echo "Last run: $(date)" > keep_alive.txt
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git add keep_alive.txt
-        git commit -m "Keep-alive: Update timestamp"
-        git push
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  maintain-schedule:
+    if: github.event_name == 'schedule'
+    needs: run-script
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record scheduled activity once a month
+        run: |
+          month=$(date -u +%Y-%m)
+          if grep -Fxq "$month" keep_alive.txt 2>/dev/null; then
+            exit 0
+          fi
+          printf '%s\n' "$month" > keep_alive.txt
+          git add keep_alive.txt
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Maintain check-in schedule'
+          git push
